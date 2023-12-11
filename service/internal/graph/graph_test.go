@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -27,6 +28,8 @@ import (
 	"go.opentelemetry.io/collector/processor/processortest"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.opentelemetry.io/collector/service/internal/servicetelemetry"
+	"go.opentelemetry.io/collector/service/internal/status"
 	"go.opentelemetry.io/collector/service/internal/testcomponents"
 	"go.opentelemetry.io/collector/service/pipelines"
 )
@@ -141,8 +144,13 @@ func TestGraphStartStop(t *testing.T) {
 			}
 
 			pg := &Graph{componentGraph: simple.NewDirectedGraph()}
+			pg.telemetry = servicetelemetry.NewNopTelemetrySettings()
+			pg.instanceIDs = make(map[int64]*component.InstanceID)
+
 			for _, edge := range tt.edges {
 				f, t := &testNode{id: edge[0]}, &testNode{id: edge[1]}
+				pg.instanceIDs[f.ID()] = &component.InstanceID{}
+				pg.instanceIDs[t.ID()] = &component.InstanceID{}
 				pg.componentGraph.SetEdge(simple.Edge{F: f, T: t})
 			}
 
@@ -168,6 +176,13 @@ func TestGraphStartStopCycle(t *testing.T) {
 	c1 := &testNode{id: component.NewIDWithName("c", "1")}
 	e1 := &testNode{id: component.NewIDWithName("e", "1")}
 
+	pg.instanceIDs = map[int64]*component.InstanceID{
+		r1.ID(): {},
+		p1.ID(): {},
+		c1.ID(): {},
+		e1.ID(): {},
+	}
+
 	pg.componentGraph.SetEdge(simple.Edge{F: r1, T: p1})
 	pg.componentGraph.SetEdge(simple.Edge{F: p1, T: c1})
 	pg.componentGraph.SetEdge(simple.Edge{F: c1, T: e1})
@@ -184,15 +199,22 @@ func TestGraphStartStopCycle(t *testing.T) {
 
 func TestGraphStartStopComponentError(t *testing.T) {
 	pg := &Graph{componentGraph: simple.NewDirectedGraph()}
+	pg.telemetry = servicetelemetry.NewNopTelemetrySettings()
+	r1 := &testNode{
+		id:       component.NewIDWithName("r", "1"),
+		startErr: errors.New("foo"),
+	}
+	e1 := &testNode{
+		id:          component.NewIDWithName("e", "1"),
+		shutdownErr: errors.New("bar"),
+	}
+	pg.instanceIDs = map[int64]*component.InstanceID{
+		r1.ID(): {},
+		e1.ID(): {},
+	}
 	pg.componentGraph.SetEdge(simple.Edge{
-		F: &testNode{
-			id:       component.NewIDWithName("r", "1"),
-			startErr: errors.New("foo"),
-		},
-		T: &testNode{
-			id:          component.NewIDWithName("e", "1"),
-			shutdownErr: errors.New("bar"),
-		},
+		F: r1,
+		T: e1,
 	})
 	assert.EqualError(t, pg.StartAll(context.Background(), componenttest.NewNopHost()), "foo")
 	assert.EqualError(t, pg.ShutdownAll(context.Background()), "bar")
@@ -363,11 +385,11 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("traces", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("traces", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 			},
@@ -379,11 +401,11 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("metrics", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("metrics", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 			},
@@ -395,11 +417,11 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("logs", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("logs", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 			},
@@ -411,16 +433,16 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("traces", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "fork")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("traces", "type0"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("traces", "type1"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("traces", "out"): {
@@ -437,16 +459,16 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("metrics", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "fork")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("metrics", "type0"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("metrics", "type1"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("metrics", "out"): {
@@ -463,16 +485,16 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				component.NewIDWithName("logs", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "fork")}, // wrapped w/ mutates: true
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("logs", "type0"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 					Processors: []component.ID{component.NewID("exampleprocessor")},
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("logs", "type1"): {
-					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "fork")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "merge")},
 				},
 				component.NewIDWithName("logs", "out"): {
@@ -551,32 +573,32 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 			pipelineConfigs: pipelines.Config{
 				component.NewIDWithName("traces", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
-					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")}, // wrapped w/ mutates: true
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("metrics", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
 					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("logs", "in"): {
 					Receivers:  []component.ID{component.NewID("examplereceiver")},
-					Processors: []component.ID{component.NewID("exampleprocessor")},
-					Exporters:  []component.ID{component.NewID("exampleconnector")}, // wrapped w/ mutates: true
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
 				},
 				component.NewIDWithName("traces", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 				component.NewIDWithName("metrics", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 				component.NewIDWithName("logs", "out"): {
-					Receivers:  []component.ID{component.NewID("exampleconnector")},
-					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")},
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewIDWithName("exampleprocessor", "mutate")}, // mutate propagates upstream to connector
 					Exporters:  []component.ID{component.NewID("exampleexporter")},
 				},
 			},
@@ -612,13 +634,91 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 			},
 			expectedPerExporter: 1,
 		},
+		{
+			name: "pipelines_conn_mutate_traces.yaml",
+			pipelineConfigs: pipelines.Config{
+				component.NewIDWithName("traces", "in"): {
+					Receivers:  []component.ID{component.NewID("examplereceiver")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+				},
+				component.NewIDWithName("traces", "out0"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+				component.NewIDWithName("traces", "middle"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+				},
+				component.NewIDWithName("traces", "out1"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+			},
+			expectedPerExporter: 2,
+		},
+		{
+			name: "pipelines_conn_mutate_metrics.yaml",
+			pipelineConfigs: pipelines.Config{
+				component.NewIDWithName("metrics", "in"): {
+					Receivers:  []component.ID{component.NewID("examplereceiver")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+				},
+				component.NewIDWithName("metrics", "out0"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+				component.NewIDWithName("metrics", "middle"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+				},
+				component.NewIDWithName("metrics", "out1"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+			},
+			expectedPerExporter: 2,
+		},
+		{
+			name: "pipelines_conn_mutate_logs.yaml",
+			pipelineConfigs: pipelines.Config{
+				component.NewIDWithName("logs", "in"): {
+					Receivers:  []component.ID{component.NewID("examplereceiver")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+				},
+				component.NewIDWithName("logs", "out0"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+				component.NewIDWithName("logs", "middle"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "inherit_mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+				},
+				component.NewIDWithName("logs", "out1"): {
+					Receivers:  []component.ID{component.NewIDWithName("exampleconnector", "mutate")},
+					Processors: []component.ID{component.NewID("exampleprocessor")},
+					Exporters:  []component.ID{component.NewID("exampleexporter")},
+				},
+			},
+			expectedPerExporter: 2,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Build the pipeline
 			set := Settings{
-				Telemetry: componenttest.NewNopTelemetrySettings(),
+				Telemetry: servicetelemetry.NewNopTelemetrySettings(),
 				BuildInfo: component.NewDefaultBuildInfo(),
 				ReceiverBuilder: receiver.NewBuilder(
 					map[component.ID]component.Config{
@@ -649,10 +749,11 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				),
 				ConnectorBuilder: connector.NewBuilder(
 					map[component.ID]component.Config{
-						component.NewID("exampleconnector"):                  testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
-						component.NewIDWithName("exampleconnector", "fork"):  testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
-						component.NewIDWithName("exampleconnector", "merge"): testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
-						component.NewID("mockforward"):                       testcomponents.MockForwardConnectorFactory.CreateDefaultConfig(),
+						component.NewID("exampleconnector"):                           testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
+						component.NewIDWithName("exampleconnector", "merge"):          testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
+						component.NewIDWithName("exampleconnector", "mutate"):         testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
+						component.NewIDWithName("exampleconnector", "inherit_mutate"): testcomponents.ExampleConnectorFactory.CreateDefaultConfig(),
+						component.NewID("mockforward"):                                testcomponents.MockForwardConnectorFactory.CreateDefaultConfig(),
 					},
 					map[component.Type]connector.Factory{
 						testcomponents.ExampleConnectorFactory.Type():     testcomponents.ExampleConnectorFactory,
@@ -679,6 +780,11 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 
 				// Determine independently if the capabilities node should report MutateData as true
 				var expectMutatesData bool
+				for _, expr := range pipelineCfg.Exporters {
+					if strings.Contains(expr.Name(), "mutate") {
+						expectMutatesData = true
+					}
+				}
 				for _, proc := range pipelineCfg.Processors {
 					if proc.Name() == "mutate" {
 						expectMutatesData = true
@@ -744,6 +850,9 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 				for _, exp := range expPipeline.exporters {
 					expConn, ok := exp.(*connectorNode)
 					if !ok {
+						continue
+					}
+					if expConn.getConsumer().Capabilities().MutatesData {
 						continue
 					}
 					// find all the pipelines of the same type where this connector is a receiver
@@ -840,22 +949,34 @@ func TestConnectorPipelinesGraph(t *testing.T) {
 			for _, e := range allExporters[component.DataTypeTraces] {
 				tracesExporter := e.(*testcomponents.ExampleExporter)
 				assert.Equal(t, test.expectedPerExporter, len(tracesExporter.Traces))
+				expected := testdata.GenerateTraces(1)
+				if len(allExporters[component.DataTypeTraces]) > 1 {
+					expected.MarkReadOnly() // multiple read-only exporters should get read-only pdata
+				}
 				for i := 0; i < test.expectedPerExporter; i++ {
-					assert.EqualValues(t, testdata.GenerateTraces(1), tracesExporter.Traces[0])
+					assert.EqualValues(t, expected, tracesExporter.Traces[0])
 				}
 			}
 			for _, e := range allExporters[component.DataTypeMetrics] {
 				metricsExporter := e.(*testcomponents.ExampleExporter)
 				assert.Equal(t, test.expectedPerExporter, len(metricsExporter.Metrics))
+				expected := testdata.GenerateMetrics(1)
+				if len(allExporters[component.DataTypeMetrics]) > 1 {
+					expected.MarkReadOnly() // multiple read-only exporters should get read-only pdata
+				}
 				for i := 0; i < test.expectedPerExporter; i++ {
-					assert.EqualValues(t, testdata.GenerateMetrics(1), metricsExporter.Metrics[0])
+					assert.EqualValues(t, expected, metricsExporter.Metrics[0])
 				}
 			}
 			for _, e := range allExporters[component.DataTypeLogs] {
 				logsExporter := e.(*testcomponents.ExampleExporter)
 				assert.Equal(t, test.expectedPerExporter, len(logsExporter.Logs))
+				expected := testdata.GenerateLogs(1)
+				if len(allExporters[component.DataTypeLogs]) > 1 {
+					expected.MarkReadOnly() // multiple read-only exporters should get read-only pdata
+				}
 				for i := 0; i < test.expectedPerExporter; i++ {
-					assert.EqualValues(t, testdata.GenerateLogs(1), logsExporter.Logs[0])
+					assert.EqualValues(t, expected, logsExporter.Logs[0])
 				}
 			}
 		})
@@ -884,7 +1005,7 @@ func TestConnectorRouter(t *testing.T) {
 
 	ctx := context.Background()
 	set := Settings{
-		Telemetry: componenttest.NewNopTelemetrySettings(),
+		Telemetry: servicetelemetry.NewNopTelemetrySettings(),
 		BuildInfo: component.NewDefaultBuildInfo(),
 		ReceiverBuilder: receiver.NewBuilder(
 			map[component.ID]component.Config{
@@ -1928,7 +2049,7 @@ func TestGraphBuildErrors(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			set := Settings{
 				BuildInfo: component.NewDefaultBuildInfo(),
-				Telemetry: componenttest.NewNopTelemetrySettings(),
+				Telemetry: servicetelemetry.NewNopTelemetrySettings(),
 				ReceiverBuilder: receiver.NewBuilder(
 					test.receiverCfgs,
 					map[component.Type]receiver.Factory{
@@ -1975,7 +2096,7 @@ func TestGraphFailToStartAndShutdown(t *testing.T) {
 	nopConnectorFactory := connectortest.NewNopFactory()
 
 	set := Settings{
-		Telemetry: componenttest.NewNopTelemetrySettings(),
+		Telemetry: servicetelemetry.NewNopTelemetrySettings(),
 		BuildInfo: component.NewDefaultBuildInfo(),
 		ReceiverBuilder: receiver.NewBuilder(
 			map[component.ID]component.Config{
@@ -2079,6 +2200,159 @@ func TestGraphFailToStartAndShutdown(t *testing.T) {
 				assert.Error(t, pipelines.ShutdownAll(context.Background()))
 			})
 		}
+	}
+}
+
+func TestStatusReportedOnStartupShutdown(t *testing.T) {
+
+	rNoErr := &testNode{id: component.NewIDWithName("r-no-err", "1")}
+	rStErr := &testNode{id: component.NewIDWithName("r-st-err", "1"), startErr: assert.AnError}
+	rSdErr := &testNode{id: component.NewIDWithName("r-sd-err", "1"), shutdownErr: assert.AnError}
+
+	eNoErr := &testNode{id: component.NewIDWithName("e-no-err", "1")}
+	eStErr := &testNode{id: component.NewIDWithName("e-st-err", "1"), startErr: assert.AnError}
+	eSdErr := &testNode{id: component.NewIDWithName("e-sd-err", "1"), shutdownErr: assert.AnError}
+
+	instanceIDs := map[*testNode]*component.InstanceID{
+		rNoErr: {ID: rNoErr.id},
+		rStErr: {ID: rStErr.id},
+		rSdErr: {ID: rSdErr.id},
+		eNoErr: {ID: eNoErr.id},
+		eStErr: {ID: eStErr.id},
+		eSdErr: {ID: eSdErr.id},
+	}
+
+	// compare two maps of status events ignoring timestamp
+	assertEqualStatuses := func(t *testing.T, evMap1, evMap2 map[*component.InstanceID][]*component.StatusEvent) {
+		assert.Equal(t, len(evMap1), len(evMap2))
+		for id, evts1 := range evMap1 {
+			evts2 := evMap2[id]
+			assert.Equal(t, len(evts1), len(evts2))
+			for i := 0; i < len(evts1); i++ {
+				ev1 := evts1[i]
+				ev2 := evts2[i]
+				assert.Equal(t, ev1.Status(), ev2.Status())
+				assert.Equal(t, ev1.Err(), ev2.Err())
+			}
+		}
+
+	}
+
+	for _, tc := range []struct {
+		name             string
+		edge             [2]*testNode
+		expectedStatuses map[*component.InstanceID][]*component.StatusEvent
+		startupErr       error
+		shutdownErr      error
+	}{
+		{
+			name: "successful startup/shutdown",
+			edge: [2]*testNode{rNoErr, eNoErr},
+			expectedStatuses: map[*component.InstanceID][]*component.StatusEvent{
+				instanceIDs[rNoErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewStatusEvent(component.StatusStopped),
+				},
+				instanceIDs[eNoErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewStatusEvent(component.StatusStopped),
+				},
+			},
+		},
+		{
+			name: "early startup error",
+			edge: [2]*testNode{rNoErr, eStErr},
+			expectedStatuses: map[*component.InstanceID][]*component.StatusEvent{
+				instanceIDs[eStErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewPermanentErrorEvent(assert.AnError),
+				},
+			},
+			startupErr: assert.AnError,
+		},
+		{
+			name: "late startup error",
+			edge: [2]*testNode{rStErr, eNoErr},
+			expectedStatuses: map[*component.InstanceID][]*component.StatusEvent{
+				instanceIDs[rStErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewPermanentErrorEvent(assert.AnError),
+				},
+				instanceIDs[eNoErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewStatusEvent(component.StatusStopped),
+				},
+			},
+			startupErr: assert.AnError,
+		},
+		{
+			name: "early shutdown error",
+			edge: [2]*testNode{rSdErr, eNoErr},
+			expectedStatuses: map[*component.InstanceID][]*component.StatusEvent{
+				instanceIDs[rSdErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewPermanentErrorEvent(assert.AnError),
+				},
+				instanceIDs[eNoErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewStatusEvent(component.StatusStopped),
+				},
+			},
+			shutdownErr: assert.AnError,
+		},
+		{
+			name: "late shutdown error",
+			edge: [2]*testNode{rNoErr, eSdErr},
+			expectedStatuses: map[*component.InstanceID][]*component.StatusEvent{
+				instanceIDs[rNoErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewStatusEvent(component.StatusStopped),
+				},
+				instanceIDs[eSdErr]: {
+					component.NewStatusEvent(component.StatusStarting),
+					component.NewStatusEvent(component.StatusOK),
+					component.NewStatusEvent(component.StatusStopping),
+					component.NewPermanentErrorEvent(assert.AnError),
+				},
+			},
+			shutdownErr: assert.AnError,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pg := &Graph{componentGraph: simple.NewDirectedGraph()}
+			pg.telemetry = servicetelemetry.NewNopTelemetrySettings()
+
+			actualStatuses := make(map[*component.InstanceID][]*component.StatusEvent)
+			rep := status.NewReporter(func(id *component.InstanceID, ev *component.StatusEvent) {
+				actualStatuses[id] = append(actualStatuses[id], ev)
+			})
+
+			pg.telemetry.Status = rep
+			rep.Ready()
+
+			e0, e1 := tc.edge[0], tc.edge[1]
+			pg.instanceIDs = map[int64]*component.InstanceID{
+				e0.ID(): instanceIDs[e0],
+				e1.ID(): instanceIDs[e1],
+			}
+			pg.componentGraph.SetEdge(simple.Edge{F: e0, T: e1})
+
+			assert.Equal(t, tc.startupErr, pg.StartAll(context.Background(), componenttest.NewNopHost()))
+			assert.Equal(t, tc.shutdownErr, pg.ShutdownAll(context.Background()))
+			assertEqualStatuses(t, tc.expectedStatuses, actualStatuses)
+		})
 	}
 }
 

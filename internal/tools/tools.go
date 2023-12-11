@@ -13,7 +13,6 @@ package tools // import "go.opentelemetry.io/collector/internal/tools"
 
 import (
 	_ "github.com/a8m/envsubst/cmd/envsubst"
-	_ "github.com/atombender/go-jsonschema/cmd/gojsonschema"
 	_ "github.com/client9/misspell/cmd/misspell"
 	_ "github.com/golangci/golangci-lint/cmd/golangci-lint"
 	_ "github.com/google/addlicense"
@@ -28,4 +27,6 @@ import (
 	_ "golang.org/x/exp/cmd/apidiff"
 	_ "golang.org/x/tools/cmd/goimports"
 	_ "golang.org/x/vuln/cmd/govulncheck"
+
+	_ "go.opentelemetry.io/collector/internal/tools/semconvkit"
 )

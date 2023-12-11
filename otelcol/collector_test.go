@@ -19,6 +19,8 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/converter/expandconverter"
+	"go.opentelemetry.io/collector/extension/extensiontest"
+	"go.opentelemetry.io/collector/processor/processortest"
 )
 
 func TestStateString(t *testing.T) {
@@ -30,15 +32,12 @@ func TestStateString(t *testing.T) {
 }
 
 func TestCollectorStartAsGoRoutine(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)
@@ -57,15 +56,12 @@ func TestCollectorStartAsGoRoutine(t *testing.T) {
 }
 
 func TestCollectorCancelContext(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)
@@ -93,16 +89,13 @@ func (p mockCfgProvider) Watch() <-chan error {
 }
 
 func TestCollectorStateAfterConfigChange(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	provider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	watcher := make(chan error, 1)
 	col, err := NewCollector(CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: &mockCfgProvider{ConfigProvider: provider, watcher: watcher},
 	})
 	require.NoError(t, err)
@@ -126,15 +119,12 @@ func TestCollectorStateAfterConfigChange(t *testing.T) {
 }
 
 func TestCollectorReportError(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	col, err := NewCollector(CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	})
 	require.NoError(t, err)
@@ -151,16 +141,106 @@ func TestCollectorReportError(t *testing.T) {
 	assert.Equal(t, StateClosed, col.GetState())
 }
 
-func TestCollectorSendSignal(t *testing.T) {
+func TestComponentStatusWatcher(t *testing.T) {
 	factories, err := nopFactories()
+	assert.NoError(t, err)
+
+	// Use a processor factory that creates "unhealthy" processor: one that
+	// always reports StatusRecoverableError after successful Start.
+	unhealthyProcessorFactory := processortest.NewUnhealthyProcessorFactory()
+	factories.Processors[unhealthyProcessorFactory.Type()] = unhealthyProcessorFactory
+
+	// Keep track of all status changes in a map.
+	changedComponents := map[*component.InstanceID][]component.Status{}
+	var mux sync.Mutex
+	onStatusChanged := func(source *component.InstanceID, event *component.StatusEvent) {
+		if source.ID.Type() != unhealthyProcessorFactory.Type() {
+			return
+		}
+		mux.Lock()
+		defer mux.Unlock()
+		changedComponents[source] = append(changedComponents[source], event.Status())
+	}
+
+	// Add a "statuswatcher" extension that will receive notifications when processor
+	// status changes.
+	factory := extensiontest.NewStatusWatcherExtensionFactory(onStatusChanged)
+	factories.Extensions[factory.Type()] = factory
+
+	// Read config from file. This config uses 3 "unhealthy" processors.
+	validProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-statuswatcher.yaml")}))
 	require.NoError(t, err)
 
+	// Create a collector
+	col, err := NewCollector(CollectorSettings{
+		BuildInfo:      component.NewDefaultBuildInfo(),
+		Factories:      func() (Factories, error) { return factories, nil },
+		ConfigProvider: validProvider,
+	})
+	require.NoError(t, err)
+
+	// Start the newly created collector.
+	wg := startCollector(context.Background(), t, col)
+
+	// An unhealthy processor asynchronously reports a recoverable error. Depending on the Go
+	// Scheduler the statuses reported at startup will be one of the two valid sequnces below.
+	startupStatuses1 := []component.Status{
+		component.StatusStarting,
+		component.StatusOK,
+		component.StatusRecoverableError,
+	}
+	startupStatuses2 := []component.Status{
+		component.StatusStarting,
+		component.StatusRecoverableError,
+	}
+	// the modulus of the actual statuses will match the modulus of the startup statuses
+	startupStatuses := func(actualStatuses []component.Status) []component.Status {
+		if len(actualStatuses)%2 == 1 {
+			return startupStatuses1
+		}
+		return startupStatuses2
+	}
+
+	// The "unhealthy" processors will now begin to asynchronously report StatusRecoverableError.
+	// We expect to see these reports.
+	assert.Eventually(t, func() bool {
+		mux.Lock()
+		defer mux.Unlock()
+
+		for k, v := range changedComponents {
+			// All processors must report a status change with the same ID
+			assert.EqualValues(t, component.NewID(unhealthyProcessorFactory.Type()), k.ID)
+			// And all must have a valid startup sequence
+			assert.Equal(t, startupStatuses(v), v)
+		}
+		// We have 3 processors with exactly the same ID in otelcol-statuswatcher.yaml
+		// We must have exactly 3 items in our map. This ensures that the "source" argument
+		// passed to status change func is unique per instance of source component despite
+		// components having the same IDs (having same ID for different component instances
+		// is a normal situation for processors).
+		return len(changedComponents) == 3
+	}, 2*time.Second, time.Millisecond*100)
+
+	col.Shutdown()
+	wg.Wait()
+
+	// Check for additional statuses after Shutdown.
+	for _, v := range changedComponents {
+		expectedStatuses := append([]component.Status{}, startupStatuses(v)...)
+		expectedStatuses = append(expectedStatuses, component.StatusStopping, component.StatusStopped)
+		assert.Equal(t, expectedStatuses, v)
+	}
+
+	assert.Equal(t, StateClosed, col.GetState())
+}
+
+func TestCollectorSendSignal(t *testing.T) {
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	col, err := NewCollector(CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	})
 	require.NoError(t, err)
@@ -185,15 +265,13 @@ func TestCollectorSendSignal(t *testing.T) {
 
 func TestCollectorFailedShutdown(t *testing.T) {
 	t.Skip("This test was using telemetry shutdown failure, switch to use a component that errors on shutdown.")
-	factories, err := nopFactories()
-	require.NoError(t, err)
 
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	col, err := NewCollector(CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	})
 	require.NoError(t, err)
@@ -216,15 +294,12 @@ func TestCollectorFailedShutdown(t *testing.T) {
 }
 
 func TestCollectorStartInvalidConfig(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-invalid.yaml")}))
 	require.NoError(t, err)
 
 	col, err := NewCollector(CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	})
 	require.NoError(t, err)
@@ -243,15 +318,12 @@ func TestCollectorStartWithTraceContextPropagation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {
-			factories, err := nopFactories()
-			require.NoError(t, err)
-
 			cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", tt.file)}))
 			require.NoError(t, err)
 
 			set := CollectorSettings{
 				BuildInfo:      component.NewDefaultBuildInfo(),
-				Factories:      factories,
+				Factories:      nopFactories,
 				ConfigProvider: cfgProvider,
 			}
 
@@ -281,15 +353,12 @@ func TestCollectorRun(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.file, func(t *testing.T) {
-			factories, err := nopFactories()
-			require.NoError(t, err)
-
 			cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", tt.file)}))
 			require.NoError(t, err)
 
 			set := CollectorSettings{
 				BuildInfo:      component.NewDefaultBuildInfo(),
-				Factories:      factories,
+				Factories:      nopFactories,
 				ConfigProvider: cfgProvider,
 			}
 			col, err := NewCollector(set)
@@ -305,15 +374,12 @@ func TestCollectorRun(t *testing.T) {
 }
 
 func TestCollectorShutdownBeforeRun(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-nop.yaml")}))
 	require.NoError(t, err)
 
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)
@@ -330,16 +396,13 @@ func TestCollectorShutdownBeforeRun(t *testing.T) {
 }
 
 func TestCollectorClosedStateOnStartUpError(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-invalid.yaml")}))
 	require.NoError(t, err)
 
 	// Load a bad config causing startup to fail
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)
@@ -353,16 +416,13 @@ func TestCollectorClosedStateOnStartUpError(t *testing.T) {
 }
 
 func TestCollectorDryRun(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(newDefaultConfigProviderSettings([]string{filepath.Join("testdata", "otelcol-invalid.yaml")}))
 	require.NoError(t, err)
 
 	// Load a bad config causing startup to fail
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)
@@ -372,9 +432,6 @@ func TestCollectorDryRun(t *testing.T) {
 }
 
 func TestPassConfmapToServiceFailure(t *testing.T) {
-	factories, err := nopFactories()
-	require.NoError(t, err)
-
 	cfgProvider, err := NewConfigProvider(ConfigProviderSettings{
 		ResolverSettings: confmap.ResolverSettings{
 			URIs:       []string{filepath.Join("testdata", "otelcol-invalid.yaml")},
@@ -386,7 +443,7 @@ func TestPassConfmapToServiceFailure(t *testing.T) {
 
 	set := CollectorSettings{
 		BuildInfo:      component.NewDefaultBuildInfo(),
-		Factories:      factories,
+		Factories:      nopFactories,
 		ConfigProvider: cfgProvider,
 	}
 	col, err := NewCollector(set)

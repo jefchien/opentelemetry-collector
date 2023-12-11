@@ -26,6 +26,12 @@ func TestTracesNotMultiplexing(t *testing.T) {
 	assert.Same(t, nop, tfc)
 }
 
+func TestTracesNotMultiplexingMutating(t *testing.T) {
+	p := &mutatingTracesSink{TracesSink: new(consumertest.TracesSink)}
+	lfc := NewTraces([]consumer.Traces{p})
+	assert.True(t, lfc.Capabilities().MutatesData)
+}
+
 func TestTracesMultiplexingNonMutating(t *testing.T) {
 	p1 := new(consumertest.TracesSink)
 	p2 := new(consumertest.TracesSink)
@@ -57,6 +63,9 @@ func TestTracesMultiplexingNonMutating(t *testing.T) {
 	assert.True(t, td == p3.AllTraces()[1])
 	assert.EqualValues(t, td, p3.AllTraces()[0])
 	assert.EqualValues(t, td, p3.AllTraces()[1])
+
+	// The data should be marked as read only.
+	assert.True(t, td.IsReadOnly())
 }
 
 func TestTracesMultiplexingMutating(t *testing.T) {
@@ -65,7 +74,7 @@ func TestTracesMultiplexingMutating(t *testing.T) {
 	p3 := &mutatingTracesSink{TracesSink: new(consumertest.TracesSink)}
 
 	tfc := NewTraces([]consumer.Traces{p1, p2, p3})
-	assert.False(t, tfc.Capabilities().MutatesData)
+	assert.True(t, tfc.Capabilities().MutatesData)
 	td := testdata.GenerateTraces(1)
 
 	for i := 0; i < 2; i++ {
@@ -91,6 +100,47 @@ func TestTracesMultiplexingMutating(t *testing.T) {
 	assert.True(t, td == p3.AllTraces()[1])
 	assert.EqualValues(t, td, p3.AllTraces()[0])
 	assert.EqualValues(t, td, p3.AllTraces()[1])
+
+	// The data should not be marked as read only.
+	assert.False(t, td.IsReadOnly())
+}
+
+func TestReadOnlyTracesMultiplexingMutating(t *testing.T) {
+	p1 := &mutatingTracesSink{TracesSink: new(consumertest.TracesSink)}
+	p2 := &mutatingTracesSink{TracesSink: new(consumertest.TracesSink)}
+	p3 := &mutatingTracesSink{TracesSink: new(consumertest.TracesSink)}
+
+	tfc := NewTraces([]consumer.Traces{p1, p2, p3})
+	assert.True(t, tfc.Capabilities().MutatesData)
+
+	tdOrig := testdata.GenerateTraces(1)
+	td := testdata.GenerateTraces(1)
+	td.MarkReadOnly()
+
+	for i := 0; i < 2; i++ {
+		err := tfc.ConsumeTraces(context.Background(), td)
+		if err != nil {
+			t.Errorf("Wanted nil got error")
+			return
+		}
+	}
+
+	// All consumers should receive the cloned data.
+
+	assert.True(t, td != p1.AllTraces()[0])
+	assert.True(t, td != p1.AllTraces()[1])
+	assert.EqualValues(t, tdOrig, p1.AllTraces()[0])
+	assert.EqualValues(t, tdOrig, p1.AllTraces()[1])
+
+	assert.True(t, td != p2.AllTraces()[0])
+	assert.True(t, td != p2.AllTraces()[1])
+	assert.EqualValues(t, tdOrig, p2.AllTraces()[0])
+	assert.EqualValues(t, tdOrig, p2.AllTraces()[1])
+
+	assert.True(t, td != p3.AllTraces()[0])
+	assert.True(t, td != p3.AllTraces()[1])
+	assert.EqualValues(t, tdOrig, p3.AllTraces()[0])
+	assert.EqualValues(t, tdOrig, p3.AllTraces()[1])
 }
 
 func TestTracesMultiplexingMixLastMutating(t *testing.T) {
@@ -126,6 +176,9 @@ func TestTracesMultiplexingMixLastMutating(t *testing.T) {
 	assert.True(t, td != p3.AllTraces()[1])
 	assert.EqualValues(t, td, p3.AllTraces()[0])
 	assert.EqualValues(t, td, p3.AllTraces()[1])
+
+	// The data should not be marked as read only.
+	assert.False(t, td.IsReadOnly())
 }
 
 func TestTracesMultiplexingMixLastNonMutating(t *testing.T) {
@@ -160,6 +213,9 @@ func TestTracesMultiplexingMixLastNonMutating(t *testing.T) {
 	assert.True(t, td == p3.AllTraces()[1])
 	assert.EqualValues(t, td, p3.AllTraces()[0])
 	assert.EqualValues(t, td, p3.AllTraces()[1])
+
+	// The data should not be marked as read only.
+	assert.False(t, td.IsReadOnly())
 }
 
 func TestTracesWhenErrors(t *testing.T) {
